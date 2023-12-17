@@ -1,0 +1,169 @@
+main:
+    steps:
+        - assignStep:
+              assign:
+                  - bucket: "<YOUR_BUCKET_ID>"
+                  - projectid: "<YOUR_PROJECT_ID>"
+                  - prefix: "<YOUR_TABLE_PREFIX>"
+                  - table_folder: "<YOUR_TABLE_GCS_FOLDER>"
+                  - query: "<YOUR_TABLE_EXPORT_QUERY>"
+                  - instance: "<YOUR_CLOUD_SQL_INSTANCE_ID>"
+                  - databaseschema: "<YOUR_CLOUD_SQL_DATABASE>"
+                  - importtable: "<YOUR_CLOUD_SQL_TABLE_TO_IMPORT>"
+                  - listResult:
+                        nextPageToken: ""
+        - export-query:
+              call: subwf_export_bq_table
+              args:
+                  bucket: ${bucket}
+                  prefix: ${prefix}
+                  query: ${query}
+                  table_folder: ${table_folder}
+                  projectid: ${projectid}
+        - importfiles:
+              call: subwf_list_file_to_import
+              args:
+                  pagetoken: ${listResult.nextPageToken}
+                  bucket: ${bucket}
+                  prefix: ${prefix}
+                  table_folder: ${table_folder}
+                  projectid: ${projectid}
+                  instance: ${instance}
+                  databaseschema: ${databaseschema}
+                  importtable: ${importtable}
+              result: listResult
+        - missing-files:
+              switch:
+                  - condition: ${"nextPageToken" in listResult}
+                    next: importfiles
+
+subwf_export_bq_table:
+    params:
+        - bucket
+        - prefix
+        - query
+        - table_folder
+        - projectid
+    steps:
+        - export_table:
+              call: googleapis.bigquery.v2.jobs.query
+              args:
+                  projectId: ${projectid}
+                  body:
+                      query: ${"EXPORT DATA OPTIONS( uri='gs://" + bucket + "/" + table_folder + "/" + prefix + "*.csv', format='CSV', overwrite=true,header=false) AS " + query}
+                      useLegacySql: false
+              result: operation
+        - chekoperation:
+              switch:
+                  - condition: ${operation.jobComplete != true}
+                    next: wait
+              next: completed
+        - chekoperation_2:
+              switch:
+                  - condition: ${operation.status.state != "DONE"}
+                    next: wait
+              next: completed
+        - completed:
+              return: "done"
+        - wait:
+              call: sys.sleep
+              args:
+                  seconds: 3
+              next: getoperation
+        - getoperation:
+              call: googleapis.bigquery.v2.jobs.get
+              args:
+                  jobId: ${operation.jobReference.jobId}
+                  projectId: ${operation.jobReference.projectId}
+              result: operation
+              next: chekoperation_2
+
+subwf_list_file_to_import:
+    params:
+        - pagetoken
+        - bucket
+        - prefix
+        - table_folder
+        - projectid
+        - instance
+        - databaseschema
+        - importtable
+    steps:
+        - list-files:
+              call: googleapis.storage.v1.objects.list
+              args:
+                  bucket: ${bucket}
+                  pageToken: ${pagetoken}
+                  prefix: ${table_folder + "/" + prefix}
+              result: listResult
+        - process-files:
+              for:
+                  value: file
+                  in: ${listResult.items}
+                  steps:
+                      - wait-import:
+                            call: sub_wf_import_file
+                            args:
+                                projectid: ${projectid}
+                                instance: ${instance}
+                                databaseschema: ${databaseschema}
+                                importtable: ${importtable}
+                                file: ${"gs://" + bucket + "/" + file.name}
+        - delete_gcs_files:
+              for:
+                  value: file
+                  in: ${listResult.items}
+                  steps:
+                      - delete_object:
+                            call: googleapis.storage.v1.objects.delete
+                            args:
+                                bucket: ${bucket}
+                                object: ${text.url_encode(file.name)}
+        - return-step:
+              return: ${listResult}
+
+sub_wf_import_file:
+    params:
+        - projectid
+        - instance
+        - databaseschema
+        - importtable
+        - file
+    steps:
+        - callImport:
+              call: http.post
+              args:
+                  url: ${"https://sqladmin.googleapis.com/sql/v1beta4/projects/" + projectid + "/instances/" + instance + "/import"}
+                  headers:
+                      Content-Type: "application/json"
+                  auth:
+                      type: OAuth2
+                      # scopes: https://www.googleapis.com/auth/cloud-platform
+                  body:
+                      importContext:
+                          uri: ${file}
+                          database: ${databaseschema}
+                          fileType: CSV
+                          csvImportOptions:
+                              table: ${importtable}
+              result: operation
+        - chekoperation:
+              switch:
+                  - condition: ${operation.body.status != "DONE"}
+                    next: wait
+              next: completed
+        - completed:
+              return: "done"
+        - wait:
+              call: sys.sleep
+              args:
+                  seconds: 3
+              next: getoperation
+        - getoperation:
+              call: http.get
+              args:
+                  url: ${operation.body.selfLink}
+                  auth:
+                      type: OAuth2
+              result: operation
+              next: chekoperation
